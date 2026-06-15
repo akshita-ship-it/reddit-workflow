@@ -1,0 +1,47 @@
+name: F5Bot Daily Parser
+
+on:
+  schedule:
+    - cron: '30 2 * * *'   # 8:00 AM IST (UTC+5:30)
+  workflow_dispatch:        # manual "Run workflow" button in GitHub Actions UI
+    inputs:
+      days_back:
+        description: 'How many days of email to look back (default: 1)'
+        required: false
+        default: '1'
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google credentials
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+          echo '${{ secrets.GOOGLE_TOKEN }}' > token.json
+
+      - name: Run parser
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          DAYS_BACK: ${{ github.event.inputs.days_back || '1' }}
+        run: python main.py
+
+      - name: Save refreshed token
+        if: always()
+        run: |
+          if [ -f token.json ]; then
+            echo "Token file present (not saved back to secrets automatically)"
+          fi
