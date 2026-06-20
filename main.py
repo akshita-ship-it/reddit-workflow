@@ -15,6 +15,9 @@ import base64
 from datetime import datetime, timedelta
 from email import message_from_bytes
 
+import time
+import urllib.request
+
 import anthropic
 import gspread
 from google.auth.transport.requests import Request
@@ -206,6 +209,59 @@ def parse_threads(email_obj) -> list[dict]:
 
     return threads
 
+# ── Reddit Content Fetcher ────────────────────────────────────────────────────
+
+def fetch_reddit_content(url: str) -> str:
+    """
+    Fetch post body + top comments from a Reddit thread using the public JSON API.
+    No API key needed — appending .json to any Reddit URL returns full content.
+    Returns a plain-text summary capped at 2000 chars.
+    """
+    try:
+        json_url = url.rstrip('/') + '.json?limit=10'
+        # Reddit requires a descriptive User-Agent or it returns 429/403
+        req = urllib.request.Request(
+            json_url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; xflowpay-lead-finder/1.0; +https://xflowpay.com)',
+                'Accept': 'application/json',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                return ''
+            data = json.loads(resp.read().decode('utf-8'))
+
+        parts = []
+
+        # Post body (selftext)
+        post = data[0]['data']['children'][0]['data']
+        selftext = post.get('selftext', '').strip()
+        if selftext and selftext != '[deleted]' and selftext != '[removed]':
+            parts.append(f"POST BODY:\n{selftext[:1000]}")
+
+        # Top-level comments
+        comments = data[1]['data']['children']
+        comment_texts = []
+        for c in comments:
+            if c.get('kind') != 't1':
+                continue
+            body = c['data'].get('body', '').strip()
+            if body and body not in ('[deleted]', '[removed]'):
+                comment_texts.append(body[:300])
+            if len(comment_texts) >= 5:
+                break
+
+        if comment_texts:
+            parts.append("TOP COMMENTS:\n" + '\n---\n'.join(comment_texts))
+
+        content = '\n\n'.join(parts)
+        return content[:2000] if content else ''
+
+    except Exception:
+        return ''
+
+
 # ── Claude Scoring ────────────────────────────────────────────────────────────
 
 SCORE_PROMPT = """\
@@ -215,11 +271,11 @@ You evaluate Reddit threads to decide if xflowpay.com should comment on them.
 {context}
 
 == Thread ==
-Subreddit : r/{subreddit}
-Title     : {title}
-F5Bot kw  : {keyword}
-Snippet   :
-{snippet}
+Subreddit    : r/{subreddit}
+Title        : {title}
+F5Bot kw     : {keyword}
+Full content :
+{post_content}
 
 == Task ==
 Score this thread 1–10 for how worthwhile it is for xflowpay to comment.
@@ -239,11 +295,11 @@ Reply with ONLY valid JSON, no markdown:
 
 def score_thread(client: anthropic.Anthropic, thread: dict) -> dict:
     prompt = SCORE_PROMPT.format(
-        context   = XFLOW_CONTEXT,
-        subreddit = thread['subreddit'],
-        title     = thread['title'],
-        keyword   = thread['keyword'],
-        snippet   = thread['snippet'][:800],
+        context      = XFLOW_CONTEXT,
+        subreddit    = thread['subreddit'],
+        title        = thread['title'],
+        keyword      = thread['keyword'],
+        post_content = thread.get('post_content', '(no content fetched)'),
     )
 
     resp = client.messages.create(
@@ -268,7 +324,7 @@ def score_thread(client: anthropic.Anthropic, thread: dict) -> dict:
 
 HEADERS = [
     'Date Found', 'Score', 'Subreddit', 'Title', 'Reddit URL',
-    'F5Bot Keyword', 'Why Relevant', 'Comment Angle', 'Snippet', 'Status',
+    'F5Bot Keyword', 'Why Relevant', 'Comment Angle', 'Post Content', 'Status',
 ]
 
 
@@ -337,7 +393,17 @@ def main():
 
     print(f"🔗 {len(unique)} unique Reddit thread(s) extracted\n")
 
-    # 3. Score with Claude
+    # 3. Fetch full Reddit content for each thread
+    print("Fetching Reddit thread content...")
+    for i, thread in enumerate(unique, 1):
+        content = fetch_reddit_content(thread['url'])
+        thread['post_content'] = content
+        status = f"{len(content)} chars" if content else "unavailable"
+        print(f"  [{i}/{len(unique)}] r/{thread['subreddit']} — {status}")
+        time.sleep(0.5)   # be polite to Reddit's servers
+    print()
+
+    # 4. Score with Claude
     relevant: list[dict] = []
     for i, thread in enumerate(unique, 1):
         short_title = thread['title'][:65]
@@ -355,7 +421,7 @@ def main():
 
     print(f"\n📊 {len(relevant)} relevant thread(s) (score ≥ {RELEVANCE_THRESHOLD})\n")
 
-    # 4. Write to Google Sheets
+    # 5. Write to Google Sheets
     if not relevant:
         print("No relevant threads today. Sheet not updated.")
         return
@@ -370,7 +436,7 @@ def main():
             t['keyword'],
             t.get('reason', ''),
             t.get('comment_angle', ''),
-            t['snippet'][:300],
+            t.get('post_content', '')[:500],
             'New',
         ]
         for t in relevant
