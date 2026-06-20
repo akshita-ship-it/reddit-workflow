@@ -35,7 +35,6 @@ SPREADSHEET_ID   = os.environ.get('SPREADSHEET_ID', '1ADQ8aXk2arLJ-URtfnnE3M-7ko
 SHEET_NAME       = 'F5Bot Leads'
 RELEVANCE_THRESHOLD = 6    # 1-10; threads scoring >= this go into the sheet
 DAYS_BACK        = int(os.environ.get('DAYS_BACK', 1))  # override via env for manual runs
-WEEKLY_RUN       = os.environ.get('WEEKLY_RUN', '').lower() in ('1', 'true', 'yes')  # enables Arctic Shift fallback
 
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
@@ -458,18 +457,14 @@ def main():
 
     print(f"🔗 {len(unique)} unique Reddit thread(s) extracted\n")
 
-    # 3. Fetch full Reddit content for each thread
-    if WEEKLY_RUN:
-        print("Fetching Reddit content (weekly mode — Arctic Shift fallback enabled)...")
-    else:
-        print("Fetching Reddit content (daily mode — Reddit JSON only)...")
+    # 3. Fetch full Reddit content for each thread (Arctic Shift always enabled as fallback)
+    print("Fetching Reddit content (Reddit JSON → Arctic Shift fallback)...")
     for i, thread in enumerate(unique, 1):
-        content = fetch_reddit_content(thread['url'], allow_arctic_shift=WEEKLY_RUN)
+        content = fetch_reddit_content(thread['url'], allow_arctic_shift=True)
         thread['post_content'] = content
-        source = 'reddit' if content and not WEEKLY_RUN else ('arctic-shift' if content else 'unavailable')
-        status = f"{len(content)} chars [{source}]" if content else "unavailable"
+        status = f"{len(content)} chars" if content else "unavailable"
         print(f"  [{i}/{len(unique)}] r/{thread['subreddit']} — {status}")
-        time.sleep(0.5)   # be polite to servers
+        time.sleep(0.5)
     print()
 
     # 4. Score with Claude
