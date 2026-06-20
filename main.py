@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from email import message_from_bytes
 
 import time
+import urllib.parse
 import urllib.request
 
 import anthropic
@@ -34,6 +35,7 @@ SPREADSHEET_ID   = os.environ.get('SPREADSHEET_ID', '1ADQ8aXk2arLJ-URtfnnE3M-7ko
 SHEET_NAME       = 'F5Bot Leads'
 RELEVANCE_THRESHOLD = 6    # 1-10; threads scoring >= this go into the sheet
 DAYS_BACK        = int(os.environ.get('DAYS_BACK', 1))  # override via env for manual runs
+WEEKLY_RUN       = os.environ.get('WEEKLY_RUN', '').lower() in ('1', 'true', 'yes')  # enables Arctic Shift fallback
 
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
@@ -211,17 +213,76 @@ def parse_threads(email_obj) -> list[dict]:
 
 # ── Reddit Content Fetcher ────────────────────────────────────────────────────
 
-def fetch_reddit_content(url: str) -> str:
+ARCTIC_SHIFT_BASE = 'https://arctic-shift.photon-reddit.com/api'
+
+
+def _post_id_from_url(url: str) -> str:
+    """Extract Reddit post ID (e.g. '1u9ytqy') from a Reddit URL."""
+    m = re.search(r'/comments/([a-z0-9]+)', url)
+    return m.group(1) if m else ''
+
+
+def _fetch_arctic_shift(url: str) -> str:
     """
-    Fetch post body + top comments from a Reddit thread using the public JSON API.
-    No API key needed — appending .json to any Reddit URL returns full content.
-    Returns a plain-text summary capped at 2000 chars.
+    Fallback: fetch post body (priority) + top comments from Arctic Shift.
+    Updates every few days so only used on weekly runs.
     """
+    parts = []
+    post_id = _post_id_from_url(url)
+
+    # 1. Post body — search by URL (most reliable)
     try:
-        json_url = url.rstrip('/') + '.json?limit=10'
-        # Reddit requires a descriptive User-Agent or it returns 429/403
         req = urllib.request.Request(
-            json_url,
+            f'{ARCTIC_SHIFT_BASE}/posts/search?url={urllib.parse.quote(url, safe="")}&limit=1',
+            headers={'User-Agent': 'xflowpay-lead-finder/1.0'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        posts = data.get('data') or []
+        if posts:
+            selftext = posts[0].get('selftext', '').strip()
+            if selftext and selftext not in ('[deleted]', '[removed]'):
+                parts.append(f"POST BODY:\n{selftext[:1200]}")
+    except Exception:
+        pass
+
+    # 2. Top comments
+    if post_id:
+        try:
+            req = urllib.request.Request(
+                f'{ARCTIC_SHIFT_BASE}/comments/search?link_id=t3_{post_id}&limit=8',
+                headers={'User-Agent': 'xflowpay-lead-finder/1.0'}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            comments = data.get('data') or []
+            bodies = [
+                c['body'].strip() for c in comments
+                if c.get('body', '').strip() not in ('', '[deleted]', '[removed]')
+            ][:5]
+            if bodies:
+                parts.append("TOP COMMENTS:\n" + '\n---\n'.join(b[:300] for b in bodies))
+        except Exception:
+            pass
+
+    content = '\n\n'.join(parts)
+    return content[:2000] if content else ''
+
+
+def fetch_reddit_content(url: str, allow_arctic_shift: bool = False) -> str:
+    """
+    Fetch post body + comments for a Reddit thread.
+
+    Primary:  Reddit public JSON API (real-time).
+    Fallback: Arctic Shift archive (only when allow_arctic_shift=True,
+              i.e. weekly runs — archive updates every few days).
+
+    Post body is prioritised over comments in both sources.
+    """
+    # ── Primary: Reddit JSON ──────────────────────────────────────────────────
+    try:
+        req = urllib.request.Request(
+            url.rstrip('/') + '.json?limit=10',
             headers={
                 'User-Agent': 'Mozilla/5.0 (compatible; xflowpay-lead-finder/1.0; +https://xflowpay.com)',
                 'Accept': 'application/json',
@@ -229,37 +290,41 @@ def fetch_reddit_content(url: str) -> str:
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status != 200:
-                return ''
+                raise ValueError(f"HTTP {resp.status}")
             data = json.loads(resp.read().decode('utf-8'))
 
         parts = []
 
-        # Post body (selftext)
         post = data[0]['data']['children'][0]['data']
         selftext = post.get('selftext', '').strip()
-        if selftext and selftext != '[deleted]' and selftext != '[removed]':
-            parts.append(f"POST BODY:\n{selftext[:1000]}")
+        if selftext and selftext not in ('[deleted]', '[removed]'):
+            parts.append(f"POST BODY:\n{selftext[:1200]}")
 
-        # Top-level comments
         comments = data[1]['data']['children']
-        comment_texts = []
+        bodies = []
         for c in comments:
             if c.get('kind') != 't1':
                 continue
             body = c['data'].get('body', '').strip()
             if body and body not in ('[deleted]', '[removed]'):
-                comment_texts.append(body[:300])
-            if len(comment_texts) >= 5:
+                bodies.append(body[:300])
+            if len(bodies) >= 5:
                 break
-
-        if comment_texts:
-            parts.append("TOP COMMENTS:\n" + '\n---\n'.join(comment_texts))
+        if bodies:
+            parts.append("TOP COMMENTS:\n" + '\n---\n'.join(bodies))
 
         content = '\n\n'.join(parts)
-        return content[:2000] if content else ''
-
+        if content:
+            return content[:2000]
+        # Empty content — fall through to Arctic Shift
     except Exception:
-        return ''
+        pass
+
+    # ── Fallback: Arctic Shift ────────────────────────────────────────────────
+    if allow_arctic_shift:
+        return _fetch_arctic_shift(url)
+
+    return ''
 
 
 # ── Claude Scoring ────────────────────────────────────────────────────────────
@@ -394,13 +459,17 @@ def main():
     print(f"🔗 {len(unique)} unique Reddit thread(s) extracted\n")
 
     # 3. Fetch full Reddit content for each thread
-    print("Fetching Reddit thread content...")
+    if WEEKLY_RUN:
+        print("Fetching Reddit content (weekly mode — Arctic Shift fallback enabled)...")
+    else:
+        print("Fetching Reddit content (daily mode — Reddit JSON only)...")
     for i, thread in enumerate(unique, 1):
-        content = fetch_reddit_content(thread['url'])
+        content = fetch_reddit_content(thread['url'], allow_arctic_shift=WEEKLY_RUN)
         thread['post_content'] = content
-        status = f"{len(content)} chars" if content else "unavailable"
+        source = 'reddit' if content and not WEEKLY_RUN else ('arctic-shift' if content else 'unavailable')
+        status = f"{len(content)} chars [{source}]" if content else "unavailable"
         print(f"  [{i}/{len(unique)}] r/{thread['subreddit']} — {status}")
-        time.sleep(0.5)   # be polite to Reddit's servers
+        time.sleep(0.5)   # be polite to servers
     print()
 
     # 4. Score with Claude
